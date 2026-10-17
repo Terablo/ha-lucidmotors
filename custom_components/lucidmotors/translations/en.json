@@ -246,6 +246,9 @@
             "efficiency_since_charge": {
                 "name": "Efficiency since charge"
             },
+            "driving_efficiency_since_charge": {
+                "name": "Driving efficiency since charge"
+            },
             "energy_type": {
                 "name": "Energy type"
             },
