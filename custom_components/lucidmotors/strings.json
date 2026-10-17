@@ -210,6 +210,9 @@
       },
       "air_suspension_status": {
         "name": "Air suspension status"
+      },
+      "last_sentry_event": {
+        "name": "Last Sentry event"
       }
     },
     "binary_sensor": {
