@@ -27,6 +27,7 @@ from lucidmotors import (
     KeepClimateStatus,
     HvacPreconditionStatus,
     MpbFaultStatus,
+    GeneralChargeStatus,
     Interior,
     RoofType,
     RearSeatConfig,
@@ -201,6 +202,17 @@ MIRROR_FOLD_STATE = {
     MirrorFoldState.MIRROR_FOLD_STATE_FOLDED_IN: "folded_in",
     MirrorFoldState.MIRROR_FOLD_STATE_FOLDED_OUT: "folded_out",
     MirrorFoldState.MIRROR_FOLD_STATE_IDLE: "idle",
+}
+
+
+# Why a charge is going the way it is. DEFAULT is the car with nothing to say,
+# DERATED_CHARGING_POWER is the car taking less power than it could, and
+# SAVETIME_TEMP_PRECON is the pack warming itself first so the charge is
+# quicker overall. UNKNOWN is left out and reads as unknown.
+GENERAL_CHARGE_STATUS = {
+    GeneralChargeStatus.GENERAL_CHARGE_DEFAULT: "none",
+    GeneralChargeStatus.GENERAL_CHARGE_DERATED_CHARGING_POWER: "derated_charging_power",
+    GeneralChargeStatus.GENERAL_CHARGE_SAVETIME_TEMP_PRECON: "savetime_temp_precon",
 }
 
 
@@ -785,6 +797,24 @@ SENSOR_TYPES: list[LucidSensorEntityDescription] = [
             MpbFaultStatus.MPB_FAULT_STATUS_CRITICAL_HAPS: "critical_protection",
             MpbFaultStatus.MPB_FAULT_STATUS_CRITICAL_HW_FLT: "critical_hardware",
         }.get(value),
+    ),
+    LucidSensorEntityDescription(
+        key="charging_general_status",
+        key_path=["state", "notifications"],
+        translation_key="charging_notice",
+        icon="mdi:ev-station",
+        device_class=SensorDeviceClass.ENUM,
+        options=list(GENERAL_CHARGE_STATUS.values()),
+        value=lambda value, _: GENERAL_CHARGE_STATUS.get(value),
+    ),
+    LucidSensorEntityDescription(
+        key="battery_charge_status",
+        key_path=["state", "notifications"],
+        translation_key="battery_charging_notice",
+        icon="mdi:battery-charging",
+        device_class=SensorDeviceClass.ENUM,
+        options=list(GENERAL_CHARGE_STATUS.values()),
+        value=lambda value, _: GENERAL_CHARGE_STATUS.get(value),
     ),
     LucidSensorEntityDescription(
         key="ride_height_status",
