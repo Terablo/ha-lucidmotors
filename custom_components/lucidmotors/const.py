@@ -20,5 +20,12 @@ FAST_UPDATE_INTERVAL = 3
 # Timeout for fast updates in case data does not actually change
 FAST_UPDATE_TIMEOUT = 2 * 60
 
+# Sentry events are not in the vehicle state, so they are fetched with their
+# own request at this interval (seconds)
+SENTRY_EVENTS_UPDATE_INTERVAL = 5 * 60
+
+# How far back the Sentry events sensor looks (days)
+SENTRY_EVENTS_WINDOW_DAYS = 30
+
 # Default target temperature for climate control (Celsius)
 DEFAULT_TARGET_TEMPERATURE = 20.0

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any, cast
 
 from lucidmotors import (
+    APIError,
+    StatusCode,
     Vehicle,
     AlarmMode,
     AlarmStatus,
@@ -67,13 +70,18 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.helpers.typing import StateType
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import DistanceConverter
 
 from . import LucidBaseEntity
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    SENTRY_EVENTS_UPDATE_INTERVAL,
+    SENTRY_EVENTS_WINDOW_DAYS,
+)
 from .coordinator import LucidDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -1022,6 +1030,17 @@ async def async_setup_entry(
                         native_unit_of_measurement=UnitOfPower.KILO_WATT,
                     ),
                 ),
+                LucidSentryEventsSensor(
+                    coordinator,
+                    vehicle,
+                    LucidSensorEntityDescription(
+                        key="last_sentry_event",
+                        key_path=[],  # Unused
+                        translation_key="last_sentry_event",
+                        icon="mdi:cctv",
+                        device_class=SensorDeviceClass.TIMESTAMP,
+                    ),
+                ),
             ]
         )
 
@@ -1452,3 +1471,122 @@ class LucidDrivingEfficiencySinceChargeSensor(LucidSinceChargeSensor):
             UnitOfLength.MILES,
         )
         return _miles_per_kwh(self._distance_mi, self._baseline.driving_kwh)
+
+
+def _enum_name(message: Any, field_name: str, prefix: str) -> str | None:
+    """Return a protobuf enum field's value name, lowercased, without prefix.
+
+    UNDEFINED and values this client does not know come back as None.
+    """
+    value = getattr(message, field_name)
+    enum = message.DESCRIPTOR.fields_by_name[field_name].enum_type
+    known = enum.values_by_number.get(value)
+    if known is None:
+        return None
+    name = known.name.removeprefix(prefix).lower()
+    return None if name == "undefined" else name
+
+
+def _sentry_event_attributes(event: Any) -> dict[str, Any]:
+    """Return the attributes describing one Sentry event."""
+    recorded_at = None
+    if event.HasField("recorded_at"):
+        recorded_at = event.recorded_at.ToDatetime(tzinfo=timezone.utc)
+    threat_level = _enum_name(event, "event_threat_level", "EVENT_THREAT_LEVEL_")
+    cameras = []
+    for media in event.media_list:
+        camera = _enum_name(media.media_info, "media_source", "MEDIA_SOURCE_")
+        if camera:
+            camera = camera.removesuffix("_camera")
+            if camera not in cameras:
+                cameras.append(camera)
+    return {
+        "id": event.event_id or None,
+        "type": _enum_name(event, "event_type", "EVENT_TYPE_"),
+        "threat_level": int(threat_level) if threat_level else None,
+        "recorded_at": recorded_at.isoformat() if recorded_at else None,
+        "images": len(event.media_list),
+        "cameras": cameras,
+    }
+
+
+class LucidSentryEventsSensor(LucidSensor):
+    """Time of the vehicle's most recent Sentry event.
+
+    Events are not part of the vehicle state, so they are fetched with
+    GetEvents when the entity is added and then every
+    SENTRY_EVENTS_UPDATE_INTERVAL seconds, over the last
+    SENTRY_EVENTS_WINDOW_DAYS days. The events attribute lists them newest
+    first. The images themselves are not exposed: the download URLs' lifetime
+    and auth are unknown.
+    """
+
+    # Changes on every fetch that finds a new event; not worth recording.
+    _unrecorded_attributes = frozenset({"events"})
+
+    _fetch_failed: bool = False
+
+    async def async_added_to_hass(self) -> None:
+        """Fetch the events now and on an interval."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass,
+                self._async_fetch_events,
+                timedelta(seconds=SENTRY_EVENTS_UPDATE_INTERVAL),
+            )
+        )
+        self.hass.async_create_background_task(
+            self._async_fetch_events(), f"lucidmotors sentry events {self.vin}"
+        )
+
+    async def _async_fetch_events(self, _now: datetime | None = None) -> None:
+        """Fetch the Sentry events in the window.
+
+        If the request fails, the sensor keeps its last value rather than
+        reporting that nothing happened.
+        """
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=SENTRY_EVENTS_WINDOW_DAYS)
+        try:
+            async with asyncio.timeout(10):
+                response = await self.coordinator.api.get_sentry_events(
+                    self.vehicle.vehicle_id, start, end
+                )
+            events = list(response.events)
+        except APIError as err:
+            if err.code != StatusCode.NOT_FOUND:
+                self._log_fetch_failure(err)
+                return
+            # No events for this vehicle.
+            events = []
+        except TimeoutError as err:
+            self._log_fetch_failure(err)
+            return
+
+        if self._fetch_failed:
+            _LOGGER.info("Fetching Sentry events for %s works again", self.vin)
+            self._fetch_failed = False
+
+        attributes = [_sentry_event_attributes(event) for event in events]
+        attributes.sort(key=lambda a: a["recorded_at"] or "", reverse=True)
+
+        latest = attributes[0]["recorded_at"] if attributes else None
+        self._attr_native_value = datetime.fromisoformat(latest) if latest else None
+        self._attr_extra_state_attributes = {
+            "event_count": len(attributes),
+            "events": attributes,
+        }
+        self.async_write_ha_state()
+
+    def _log_fetch_failure(self, err: Exception) -> None:
+        """Log a failed fetch once, until one succeeds again."""
+        log = _LOGGER.debug if self._fetch_failed else _LOGGER.warning
+        log("Failed to fetch Sentry events for %s: %r", self.vin, err)
+        self._fetch_failed = True
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        # The value comes from _async_fetch_events, not from the vehicle state.
+        super(LucidSensor, self)._handle_coordinator_update()
