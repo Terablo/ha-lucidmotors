@@ -20,5 +20,9 @@ FAST_UPDATE_INTERVAL = 3
 # Timeout for fast updates in case data does not actually change
 FAST_UPDATE_TIMEOUT = 2 * 60
 
+# Recall and service notices are not in the vehicle state, so they are
+# fetched with their own requests at this much slower interval (seconds)
+NOTICES_UPDATE_INTERVAL = 60 * 60
+
 # Default target temperature for climate control (Celsius)
 DEFAULT_TARGET_TEMPERATURE = 20.0

@@ -356,6 +356,9 @@
             },
             "air_suspension_status": {
                 "name": "Air suspension status"
+            },
+            "notices": {
+                "name": "Recall and service notices"
             }
         },
         "select": {

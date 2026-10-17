@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 import logging
-from typing import cast, Optional
+from typing import Any, cast, Optional
 
 from lucidmotors import (
+    APIError,
+    GetDocumentInfoResponse,
+    StatusCode,
     Vehicle,
     AlarmMode,
     AlarmStatus,
@@ -55,11 +60,12 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import StateType
 from homeassistant.util.unit_conversion import DistanceConverter
 
 from . import LucidBaseEntity
-from .const import DOMAIN
+from .const import DOMAIN, NOTICES_UPDATE_INTERVAL
 from .coordinator import LucidDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -680,6 +686,16 @@ async def async_setup_entry(
                         native_unit_of_measurement=UnitOfPower.KILO_WATT,
                     ),
                 ),
+                LucidNoticesSensor(
+                    coordinator,
+                    vehicle,
+                    LucidSensorEntityDescription(
+                        key="notices",
+                        key_path=[],  # Unused
+                        translation_key="notices",
+                        icon="mdi:file-document-alert-outline",
+                    ),
+                ),
             ]
         )
 
@@ -827,4 +843,94 @@ class LucidPowerSensor(LucidSensor):
         self._saved_charge = current_charge
 
         self._attr_native_value = cast(StateType, value)
+        super(LucidSensor, self)._handle_coordinator_update()
+
+
+def _notice_attributes(kind: str, notice: GetDocumentInfoResponse) -> dict[str, Any]:
+    """Return the attributes describing one notice."""
+    created_at = None
+    if notice.info.HasField("created_at"):
+        created_at = notice.info.created_at.ToDatetime(tzinfo=timezone.utc)
+    return {
+        "type": kind,
+        "description": notice.info.description or None,
+        "url": notice.url or None,
+        "created_at": created_at.isoformat() if created_at else None,
+    }
+
+
+class LucidNoticesSensor(LucidSensor):
+    """Number of recall and service notices for the vehicle.
+
+    Notices are not part of the vehicle state. Each is its own request, so
+    they are fetched when the entity is added and then every
+    NOTICES_UPDATE_INTERVAL seconds, not on every poll. The API returns at
+    most one document per type, so the count is 0, 1 or 2, and the notices
+    attribute lists them, recall first.
+    """
+
+    # The URLs may change from one fetch to the next.
+    _unrecorded_attributes = frozenset({"notices"})
+
+    _fetch_failed: bool = False
+
+    async def async_added_to_hass(self) -> None:
+        """Fetch the notices now and on an interval."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass,
+                self._async_fetch_notices,
+                timedelta(seconds=NOTICES_UPDATE_INTERVAL),
+            )
+        )
+        self.hass.async_create_background_task(
+            self._async_fetch_notices(), f"lucidmotors notices {self.vin}"
+        )
+
+    async def _async_fetch_notices(self, _now: datetime | None = None) -> None:
+        """Fetch the recall and service notices.
+
+        If either request fails, the sensor keeps its last value rather than
+        reporting fewer notices than the car has.
+        """
+        api = self.coordinator.api
+        notices = []
+        for kind, fetch in (
+            ("recall", api.get_recall_notice),
+            ("service", api.get_service_notice),
+        ):
+            try:
+                async with asyncio.timeout(10):
+                    notice = await fetch(self.vehicle)
+            except APIError as err:
+                if err.code == StatusCode.NOT_FOUND:
+                    # No document of this type for this vehicle.
+                    continue
+                self._log_fetch_failure(kind, err)
+                return
+            except TimeoutError as err:
+                self._log_fetch_failure(kind, err)
+                return
+            if notice.url or notice.info.description:
+                notices.append(_notice_attributes(kind, notice))
+
+        if self._fetch_failed:
+            _LOGGER.info("Fetching notices for %s works again", self.vin)
+            self._fetch_failed = False
+
+        self._attr_native_value = len(notices)
+        self._attr_extra_state_attributes = {"notices": notices}
+        self.async_write_ha_state()
+
+    def _log_fetch_failure(self, kind: str, err: Exception) -> None:
+        """Log a failed fetch once, until one succeeds again."""
+        log = _LOGGER.debug if self._fetch_failed else _LOGGER.warning
+        log("Failed to fetch %s notice for %s: %r", kind, self.vin, err)
+        self._fetch_failed = True
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        # The value comes from _async_fetch_notices, not from the vehicle state.
         super(LucidSensor, self)._handle_coordinator_update()
