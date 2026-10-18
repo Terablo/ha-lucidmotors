@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
@@ -174,6 +175,20 @@ def _cable_connected(charge_state: int) -> bool | None:
     if charge_state == ChargeState.CHARGE_STATE_UNKNOWN:
         return None
     return charge_state != ChargeState.CHARGE_STATE_NOT_CONNECTED
+
+
+# Power usage and Efficiency are a change in battery energy divided by a change
+# in time or distance. Between two consecutive polls that change can be a few
+# seconds or a few metres while the energy moves by a whole step, and the
+# result is enormous. So each waits for at least this much before computing a
+# new value, and keeps its previous value until then.
+MIN_POWER_INTERVAL_S = 60.0
+MIN_EFFICIENCY_DISTANCE_MI = 1.0
+# The energy reading moves in steps, so one mile alone still read anywhere from
+# 57 to 636 Wh/mi on a real drive. Efficiency therefore updates every mile but
+# reports the last few miles together, weighted by distance: a hard
+# acceleration still moves it, by its share of the window.
+EFFICIENCY_WINDOW_MI = 3.0
 
 
 @dataclass(frozen=True)
@@ -848,10 +863,30 @@ class LucidSensor(LucidBaseEntity, SensorEntity):
 
 
 class LucidEfficiencySensor(LucidSensor):
-    """Driving efficiency sensor derived from Lucid API data."""
+    """Driving efficiency sensor derived from Lucid API data.
 
-    _saved_odometer: Optional[float] = None
-    _saved_charge: Optional[float] = None
+    Battery energy used over distance driven, in Wh/mi. A new value comes every
+    MIN_EFFICIENCY_DISTANCE_MI and covers the last EFFICIENCY_WINDOW_MI driven
+    (fewer at the start). Only polls where the odometer moved count, so
+    energy used or added while parked (climate, Sentry, charging) is not put
+    on the next drive.
+    """
+
+    def __init__(
+        self,
+        coordinator: LucidDataUpdateCoordinator,
+        vehicle: Vehicle,
+        description: LucidSensorEntityDescription,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, vehicle, description)
+        self._last_odometer_km: float | None = None
+        self._last_kwhr: float | None = None
+        self._distance_km = 0.0
+        self._energy_kwh = 0.0
+        # Completed stretches of at least MIN_EFFICIENCY_DISTANCE_MI, oldest
+        # first, as (miles, kWh).
+        self._stretches: deque[tuple[float, float]] = deque()
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -862,53 +897,78 @@ class LucidEfficiencySensor(LucidSensor):
             self.vehicle.config.nickname,
         )
 
-        current_odometer = self.vehicle.state.chassis.odometer_km
-        current_charge = self.vehicle.state.battery.kwhr
+        odometer_km = self.vehicle.state.chassis.odometer_km
+        kwhr = _plausible_kwhr(self.vehicle.state.battery.kwhr, "battery energy")
+        # An unset odometer reads 0; skip it like a sentinel.
+        if kwhr is not None and odometer_km > 0:
+            self._add_sample(odometer_km, kwhr)
 
-        if self._saved_odometer is None:
-            self._saved_odometer = current_odometer
-        if self._saved_charge is None:
-            self._saved_charge = current_charge
+        super(LucidSensor, self)._handle_coordinator_update()
 
-        odo_diff = current_odometer - self._saved_odometer
-        charge_diff = current_charge - self._saved_charge
+    def _add_sample(self, odometer_km: float, kwhr: float) -> None:
+        last_odometer_km = self._last_odometer_km
+        last_kwhr = self._last_kwhr
+        self._last_odometer_km = odometer_km
+        self._last_kwhr = kwhr
 
-        # Convert kWh to Wh
-        charge_diff *= 1000.0
+        if last_odometer_km is None or last_kwhr is None:
+            return
+        if odometer_km < last_odometer_km:
+            # Not a drive. Start the distance over.
+            self._distance_km = 0.0
+            self._energy_kwh = 0.0
+            self._stretches.clear()
+            return
+        if odometer_km == last_odometer_km:
+            # Parked, or the same snapshot again.
+            return
 
-        # What we're looking for is the rate of discharge, which is negative
-        # charge_diff.
-        charge_diff = -charge_diff
+        self._distance_km += odometer_km - last_odometer_km
+        self._energy_kwh += last_kwhr - kwhr
 
         # HA doesn't have automatic unit conversion for Wh/mi type units, so
         # we'll have to convert manually here to miles so us non-metric folks
         # can survive.
-        odo_diff = DistanceConverter.convert(
-            odo_diff,
+        distance_mi = DistanceConverter.convert(
+            self._distance_km,
             UnitOfLength.KILOMETERS,
             UnitOfLength.MILES,
         )
+        if distance_mi < MIN_EFFICIENCY_DISTANCE_MI:
+            return
 
-        if odo_diff == 0.0:
-            # We haven't moved. Also avoid zero division.
-            value = None
-        else:
-            # Wh / mi
-            value = charge_diff / odo_diff
+        self._stretches.append((distance_mi, self._energy_kwh))
+        self._distance_km = 0.0
+        self._energy_kwh = 0.0
+        # Drop the oldest stretch while the rest still cover the window.
+        total_mi = sum(miles for miles, _ in self._stretches)
+        while total_mi - self._stretches[0][0] >= EFFICIENCY_WINDOW_MI:
+            total_mi -= self._stretches.popleft()[0]
+        total_kwh = sum(kwh for _, kwh in self._stretches)
 
-        # Update saved
-        self._saved_odometer = current_odometer
-        self._saved_charge = current_charge
-
-        self._attr_native_value = cast(StateType, value)
-        super(LucidSensor, self)._handle_coordinator_update()
+        # Energy used (kWh to Wh) per mile. Negative when regeneration put
+        # back more than was used, which a long descent can do.
+        self._attr_native_value = total_kwh * 1000.0 / total_mi
 
 
 class LucidPowerSensor(LucidSensor):
-    """Momentary power usage sensor derived from Lucid API data."""
+    """Power usage sensor derived from Lucid API data.
 
-    _saved_last_updated_ms: Optional[int] = None
-    _saved_charge: Optional[float] = None
+    The rate the battery's energy is falling, in kW, averaged over at least
+    MIN_POWER_INTERVAL_S of the car's own timestamps. Negative while the
+    battery is gaining energy (charging).
+    """
+
+    def __init__(
+        self,
+        coordinator: LucidDataUpdateCoordinator,
+        vehicle: Vehicle,
+        description: LucidSensorEntityDescription,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, vehicle, description)
+        self._saved_last_updated_ms: int | None = None
+        self._saved_kwhr: float | None = None
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -919,36 +979,32 @@ class LucidPowerSensor(LucidSensor):
             self.vehicle.config.nickname,
         )
 
-        current_update_ms = self.vehicle.state.last_updated_ms
-        current_charge = self.vehicle.state.battery.kwhr
+        last_updated_ms = self.vehicle.state.last_updated_ms
+        kwhr = _plausible_kwhr(self.vehicle.state.battery.kwhr, "battery energy")
+        if kwhr is not None and last_updated_ms > 0:
+            self._add_sample(last_updated_ms, kwhr)
 
-        if self._saved_last_updated_ms is None:
-            self._saved_last_updated_ms = current_update_ms
-        if self._saved_charge is None:
-            self._saved_charge = current_charge
-
-        time_diff_ms = current_update_ms - self._saved_last_updated_ms
-        charge_diff = current_charge - self._saved_charge
-
-        # What we're looking for is the rate of discharge, which is negative
-        # charge_diff.
-        charge_diff = -charge_diff
-
-        time_diff_h = time_diff_ms / 3600000.0
-
-        if time_diff_h == 0:
-            # Sensors have not been updated. Also avoid zero division.
-            value = None
-        else:
-            # kWh / h, aka kW
-            value = charge_diff / time_diff_h
-
-        # Update saved
-        self._saved_last_updated_ms = current_update_ms
-        self._saved_charge = current_charge
-
-        self._attr_native_value = cast(StateType, value)
         super(LucidSensor, self)._handle_coordinator_update()
+
+    def _add_sample(self, last_updated_ms: int, kwhr: float) -> None:
+        if (
+            self._saved_last_updated_ms is None
+            or self._saved_kwhr is None
+            or last_updated_ms < self._saved_last_updated_ms
+        ):
+            self._saved_last_updated_ms = last_updated_ms
+            self._saved_kwhr = kwhr
+            return
+
+        elapsed_h = (last_updated_ms - self._saved_last_updated_ms) / 3600000.0
+        if elapsed_h * 3600.0 < MIN_POWER_INTERVAL_S:
+            # Includes the same snapshot seen again.
+            return
+
+        # kWh / h, aka kW. The rate of discharge, so energy falling is positive.
+        self._attr_native_value = (self._saved_kwhr - kwhr) / elapsed_h
+        self._saved_last_updated_ms = last_updated_ms
+        self._saved_kwhr = kwhr
 
 
 @dataclass
