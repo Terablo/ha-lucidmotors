@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 import asyncio
@@ -228,11 +229,14 @@ GENERAL_CHARGE_STATUS = {
 # in time or distance. Between two consecutive polls that change can be a few
 # seconds or a few metres while the energy moves by a whole step, and the
 # result is enormous. So each waits for at least this much before computing a
-# new value, and keeps its previous value until then. Efficiency needs the
-# longer span because the energy reading moves in steps: over one mile a real
-# drive still read anywhere from 57 to 636 Wh/mi.
+# new value, and keeps its previous value until then.
 MIN_POWER_INTERVAL_S = 60.0
-MIN_EFFICIENCY_DISTANCE_MI = 3.0
+MIN_EFFICIENCY_DISTANCE_MI = 1.0
+# The energy reading moves in steps, so one mile alone still read anywhere from
+# 57 to 636 Wh/mi on a real drive. Efficiency therefore updates every mile but
+# reports the last few miles together, weighted by distance: a hard
+# acceleration still moves it, by its share of the window.
+EFFICIENCY_WINDOW_MI = 3.0
 
 
 # The alarm's status in words. The client library words ARMED, DISARMED and
@@ -1106,8 +1110,9 @@ class LucidSensor(LucidBaseEntity, SensorEntity):
 class LucidEfficiencySensor(LucidSensor):
     """Driving efficiency sensor derived from Lucid API data.
 
-    Battery energy used over distance driven, in Wh/mi, taken over at least
-    MIN_EFFICIENCY_DISTANCE_MI. Only polls where the odometer moved count, so
+    Battery energy used over distance driven, in Wh/mi. A new value comes every
+    MIN_EFFICIENCY_DISTANCE_MI and covers the last EFFICIENCY_WINDOW_MI driven
+    (fewer at the start). Only polls where the odometer moved count, so
     energy used or added while parked (climate, Sentry, charging) is not put
     on the next drive.
     """
@@ -1124,6 +1129,9 @@ class LucidEfficiencySensor(LucidSensor):
         self._last_kwhr: float | None = None
         self._distance_km = 0.0
         self._energy_kwh = 0.0
+        # Completed stretches of at least MIN_EFFICIENCY_DISTANCE_MI, oldest
+        # first, as (miles, kWh).
+        self._stretches: deque[tuple[float, float]] = deque()
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -1154,6 +1162,7 @@ class LucidEfficiencySensor(LucidSensor):
             # Not a drive. Start the distance over.
             self._distance_km = 0.0
             self._energy_kwh = 0.0
+            self._stretches.clear()
             return
         if odometer_km == last_odometer_km:
             # Parked, or the same snapshot again.
@@ -1173,11 +1182,18 @@ class LucidEfficiencySensor(LucidSensor):
         if distance_mi < MIN_EFFICIENCY_DISTANCE_MI:
             return
 
-        # Energy used (kWh to Wh) per mile. Negative when regeneration put
-        # back more than was used, which a long descent can do.
-        self._attr_native_value = self._energy_kwh * 1000.0 / distance_mi
+        self._stretches.append((distance_mi, self._energy_kwh))
         self._distance_km = 0.0
         self._energy_kwh = 0.0
+        # Drop the oldest stretch while the rest still cover the window.
+        total_mi = sum(miles for miles, _ in self._stretches)
+        while total_mi - self._stretches[0][0] >= EFFICIENCY_WINDOW_MI:
+            total_mi -= self._stretches.popleft()[0]
+        total_kwh = sum(kwh for _, kwh in self._stretches)
+
+        # Energy used (kWh to Wh) per mile. Negative when regeneration put
+        # back more than was used, which a long descent can do.
+        self._attr_native_value = total_kwh * 1000.0 / total_mi
 
 
 class LucidPowerSensor(LucidSensor):
