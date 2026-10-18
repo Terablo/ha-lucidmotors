@@ -228,9 +228,11 @@ GENERAL_CHARGE_STATUS = {
 # in time or distance. Between two consecutive polls that change can be a few
 # seconds or a few metres while the energy moves by a whole step, and the
 # result is enormous. So each waits for at least this much before computing a
-# new value, and keeps its previous value until then.
+# new value, and keeps its previous value until then. Efficiency needs the
+# longer span because the energy reading moves in steps: over one mile a real
+# drive still read anywhere from 57 to 636 Wh/mi.
 MIN_POWER_INTERVAL_S = 60.0
-MIN_EFFICIENCY_DISTANCE_MI = 1.0
+MIN_EFFICIENCY_DISTANCE_MI = 3.0
 
 
 # The alarm's status in words. The client library words ARMED, DISARMED and
